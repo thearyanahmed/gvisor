@@ -1224,6 +1224,16 @@ func tryOpen(open func(int) (int, error)) (hostFD int, err error) {
 	return
 }
 
+// isNFS checks if the file descriptor is on an NFS filesystem.
+func isNFS(hostFD int) bool {
+	var statfs unix.Statfs_t
+	if err := unix.Fstatfs(hostFD, &statfs); err != nil {
+		return false
+	}
+	// NFS_SUPER_MAGIC = 0x6969
+	return statfs.Type == unix.NFS_SUPER_MAGIC
+}
+
 func fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {
 	// "If the owner or group is specified as -1, then that ID is not changed"
 	// - chown(2). Only bother making the syscall if the owner is changing.
@@ -1238,7 +1248,15 @@ func fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {
 	if gid.Ok() {
 		g = int(gid)
 	}
-	return unix.Fchownat(hostFD, "", u, g, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	err := unix.Fchownat(hostFD, "", u, g, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	// on NFS with root_squash, fchown fails with EPERM because root is
+	// squashed to nobody. skip fchown on NFS to allow file creation.
+	// see: https://github.com/google/gvisor/issues/575
+	if err == unix.EPERM && isNFS(hostFD) {
+		log.Debugf("patch 0.2 : skipping fchown on NFS filesystem (root_squash): %v", err)
+		return nil
+	}
+	return err
 }
 
 func fstatTo(hostFD int) (linux.Statx, error) {

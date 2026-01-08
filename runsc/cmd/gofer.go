@@ -792,7 +792,8 @@ func adjustMountOptions(conf *config.Config, path string, opts []string) ([]stri
 		// for flushing file data to the server. Such handle sharing prevents the
 		// application's close(2) syscall from being propagated to the host. Hence
 		// disable file handle sharing, so remote files are flushed correctly.
-		rv = append(rv, "disable_file_handle_sharing")
+		fmt.Printf("\npatch 0.1 : not disabling file handle sharing for fs type: %x\n", statfs.Type)
+		// rv = append(rv, "disable_file_handle_sharing")
 	}
 	return rv, nil
 }

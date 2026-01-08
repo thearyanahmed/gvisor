@@ -9,3 +9,4 @@
 /repo.key
 # Generate webhook admission.
 /test/kubernetes/gvisor-injection-admission-webhook.yaml
+runsc-patched
