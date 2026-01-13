@@ -14,5 +14,11 @@ echo "building runsc..."
 bazel build //runsc:runsc
 
 echo "copying binary..."
-cp bazel-bin/runsc/runsc_/runsc /src/runsc-patched
-chmod +x /src/runsc-patched
+# copy to /tmp first, then move with proper ownership
+cp bazel-bin/runsc/runsc_/runsc /tmp/runsc-patched
+chmod +x /tmp/runsc-patched
+# get the uid/gid of the mounted source directory
+SRC_UID=$(stat -c %u /src)
+SRC_GID=$(stat -c %g /src)
+chown "$SRC_UID:$SRC_GID" /tmp/runsc-patched
+mv /tmp/runsc-patched /src/runsc-patched

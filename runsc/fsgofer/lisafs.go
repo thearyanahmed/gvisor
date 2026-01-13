@@ -561,7 +561,11 @@ func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 // OpenCreate implements lisafs.ControlFDImpl.OpenCreate.
 func (fd *controlFDLisa) OpenCreate(mode linux.FileMode, uid lisafs.UID, gid lisafs.GID, name string, flags uint32) (*lisafs.ControlFD, linux.Statx, *lisafs.OpenFD, int, error) {
 	createFlags := unix.O_CREAT | unix.O_EXCL | unix.O_RDONLY | unix.O_NONBLOCK | openFlags
-	childHostFD, err := unix.Openat(fd.hostFD, name, createFlags, uint32(mode&^linux.FileTypeMask))
+	// patch 0.3: use setfsuid/setfsgid so file is created with requested ownership
+	// this works on NFS where fchown fails due to root_squash
+	childHostFD, err := withFSUIDAndGID(uid, gid, func() (int, error) {
+		return unix.Openat(fd.hostFD, name, createFlags, uint32(mode&^linux.FileTypeMask))
+	})
 	if err != nil {
 		return nil, linux.Statx{}, nil, -1, err
 	}
@@ -611,7 +615,11 @@ func (fd *controlFDLisa) OpenCreate(mode linux.FileMode, uid lisafs.UID, gid lis
 
 // Mkdir implements lisafs.ControlFDImpl.Mkdir.
 func (fd *controlFDLisa) Mkdir(mode linux.FileMode, uid lisafs.UID, gid lisafs.GID, name string) (*lisafs.ControlFD, linux.Statx, error) {
-	if err := unix.Mkdirat(fd.hostFD, name, uint32(mode&^linux.FileTypeMask)); err != nil {
+	// patch 0.3: use setfsuid/setfsgid so directory is created with requested ownership
+	_, err := withFSUIDAndGID(uid, gid, func() (struct{}, error) {
+		return struct{}{}, unix.Mkdirat(fd.hostFD, name, uint32(mode&^linux.FileTypeMask))
+	})
+	if err != nil {
 		return nil, linux.Statx{}, err
 	}
 	cu := cleanup.Make(func() {
@@ -654,7 +662,11 @@ func (fd *controlFDLisa) Mknod(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 		return nil, linux.Statx{}, unix.EPERM
 	}
 
-	if err := unix.Mknodat(fd.hostFD, name, uint32(mode), 0); err != nil {
+	// patch 0.3: use setfsuid/setfsgid so node is created with requested ownership
+	_, err := withFSUIDAndGID(uid, gid, func() (struct{}, error) {
+		return struct{}{}, unix.Mknodat(fd.hostFD, name, uint32(mode), 0)
+	})
+	if err != nil {
 		return nil, linux.Statx{}, err
 	}
 	cu := cleanup.Make(func() {
@@ -690,7 +702,11 @@ func (fd *controlFDLisa) Mknod(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 
 // Symlink implements lisafs.ControlFDImpl.Symlink.
 func (fd *controlFDLisa) Symlink(name string, target string, uid lisafs.UID, gid lisafs.GID) (*lisafs.ControlFD, linux.Statx, error) {
-	if err := unix.Symlinkat(target, fd.hostFD, name); err != nil {
+	// patch 0.3: use setfsuid/setfsgid so symlink is created with requested ownership
+	_, err := withFSUIDAndGID(uid, gid, func() (struct{}, error) {
+		return struct{}{}, unix.Symlinkat(target, fd.hostFD, name)
+	})
+	if err != nil {
 		return nil, linux.Statx{}, err
 	}
 	cu := cleanup.Make(func() {
@@ -1257,6 +1273,66 @@ func fchown(hostFD int, uid lisafs.UID, gid lisafs.GID) error {
 		return nil
 	}
 	return err
+}
+
+// withFSUIDAndGID executes the given function with the filesystem UID/GID
+// temporarily set to the specified values. this enables files created on NFS
+// to be owned by the app's UID rather than root (which gets squashed to nobody).
+//
+// how it works:
+// 1. locks the goroutine to an OS thread (required for per-thread credentials)
+// 2. saves current EUID/EGID (FSUID defaults to EUID)
+// 3. sets new FSUID/FSGID using setfsuid/setfsgid syscalls
+// 4. executes the operation
+// 5. restores original FSUID/FSGID
+// 6. unlocks the OS thread
+//
+// this is patch 0.3 for NFS per-app ownership.
+// see: https://man7.org/linux/man-pages/man2/setfsuid.2.html
+func withFSUIDAndGID[T any](uid lisafs.UID, gid lisafs.GID, fn func() (T, error)) (T, error) {
+	// if neither uid nor gid is set, skip switching
+	if !uid.Ok() && !gid.Ok() {
+		return fn()
+	}
+
+	// lock goroutine to OS thread since setfsuid/setfsgid are per-thread
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// save current effective UID/GID (FSUID/FSGID default to these)
+	prevUID := unix.Geteuid()
+	prevGID := unix.Getegid()
+
+	// set new FSUID if requested
+	if uid.Ok() {
+		if err := unix.Setfsuid(int(uid)); err != nil {
+			var zero T
+			return zero, fmt.Errorf("setfsuid(%d) failed: %v", uid, err)
+		}
+	}
+
+	// set new FSGID if requested
+	if gid.Ok() {
+		if err := unix.Setfsgid(int(gid)); err != nil {
+			// restore FSUID before returning error
+			unix.Setfsuid(prevUID)
+			var zero T
+			return zero, fmt.Errorf("setfsgid(%d) failed: %v", gid, err)
+		}
+	}
+
+	// execute the operation with the new FSUID/FSGID
+	result, err := fn()
+
+	// restore original FSUID/FSGID (ignore errors on restore)
+	if gid.Ok() {
+		unix.Setfsgid(prevGID)
+	}
+	if uid.Ok() {
+		unix.Setfsuid(prevUID)
+	}
+
+	return result, err
 }
 
 func fstatTo(hostFD int) (linux.Statx, error) {
